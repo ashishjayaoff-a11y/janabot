@@ -1,0 +1,50 @@
+name: Watch Carnival Now Showing
+
+on:
+  schedule:
+    # Every 5 hours. Each run internally polls every ~90s for ~4h50m,
+    # so coverage is continuous — the cron cadence just restarts the
+    # window before it would otherwise run out.
+    - cron: "0 */5 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: carnival-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Poll Now Showing and alert on match
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          WORKFLOW_FILE: watch.yml
+          TARGET_MOVIE: "Jananayagan"
+          TARGET_DATE_VALUE: "2026-07-23T00:00:00"
+          CUTOFF_HOUR: "19"
+          LOCATION: "Singapore"
+          POLL_INTERVAL_SECONDS: "90"
+          MAX_RUNTIME_SECONDS: "17400"
+        run: python3 watch_now_showing.py
+
+      - name: Persist state
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "Update watch state"
+            git push
+          fi
