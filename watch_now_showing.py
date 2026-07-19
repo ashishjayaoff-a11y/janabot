@@ -8,15 +8,20 @@ string embedded in the site's public JS bundle (AllJavaScripts,
 pure stdlib Python so it can call the API directly, with no browser/scraping
 involved.
 
-Progress moves through three stages, persisted in a state file so restarts
-(a fresh GitHub Actions run every few hours) don't lose track or re-alert:
+Progress is persisted in a state file so restarts (a fresh GitHub Actions run
+every few hours) don't lose track or re-alert:
 
 1. "movie"    — waiting for the target movie to appear in Now Showing.
-2. "showtime" — movie is showing; waiting for a showtime after the cutoff
-                hour to appear on the target date (in any bookable state).
-3. "bookable" — a matching showtime is listed but not yet bookable; waiting
-                for it to open for booking.
-4. "done"     — a matching, bookable showtime was found and alerted.
+2. "watching" — movie is showing; on every poll, alerts once for each new
+                showtime that appears inside the target time window on the
+                target date (whatever its bookable status), and again for
+                any of those that later flip from listed to bookable.
+
+Every matching showtime gets its own round of alerts — the site sometimes
+releases showtimes for a date in batches, so an earlier slot inside the
+window shouldn't stop the watch from also catching a later one. The watch
+only stops once the target date itself has fully passed (with a safety
+buffer), not once a single match is found.
 
 No external dependencies — stdlib only (hmac, hashlib, base64, urllib, json).
 """
@@ -94,7 +99,7 @@ def fetch_showtimes(
     date_value: str,
     location: str = "Singapore",
 ) -> list[dict[str, Any]]:
-    """Return one entry per (cinema, session): {cinema, time_label, bookable, time_obj}."""
+    """Return one entry per (cinema, session): {cinema, time_label, bookable, time_obj, session_id}."""
     body = _api_get(
         "GetCinemaAndShowTimeByMovie",
         location=location,
@@ -103,17 +108,20 @@ def fetch_showtimes(
     )
     sessions: list[dict[str, Any]] = []
     for cinema in body.get("responseCinemaWithShowTime", []):
-        tokens = [t.strip() for t in cinema.get("showTime", "").split(",") if t.strip()]
-        for token in tokens:
+        time_tokens = [t.strip() for t in cinema.get("showTime", "").split(",") if t.strip()]
+        id_tokens = [t.strip() for t in cinema.get("longSessionID", "").split(",") if t.strip()]
+        for index, token in enumerate(time_tokens):
             bookable = token[-1] == "T"
             time_label = token[:-1].strip()
             time_obj = datetime.datetime.strptime(time_label, "%I:%M %p").time()
+            session_id = id_tokens[index] if index < len(id_tokens) else f"{cinema.get('cinemaName')}|{time_label}"
             sessions.append(
                 {
                     "cinema": cinema.get("cinemaName"),
                     "time_label": time_label,
                     "bookable": bookable,
                     "time_obj": time_obj,
+                    "session_id": session_id,
                 }
             )
     return sessions
@@ -182,7 +190,15 @@ def disable_current_workflow(*, github_token: str, repo: str, workflow_file: str
 
 # ── State persistence ────────────────────────────────────────────────────────
 
-_DEFAULT_STATE: dict[str, Any] = {"stage": "movie", "movie_code": None}
+_DEFAULT_STATE: dict[str, Any] = {
+    "stage": "movie",
+    "movie_code": None,
+    "movie_name": None,
+    "alerted_session_ids": [],
+    "bookable_session_ids": [],
+}
+
+_STOP_BUFFER = datetime.timedelta(days=2)
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -200,6 +216,12 @@ def _format_sessions(sessions: list[dict[str, Any]]) -> str:
         f"{s['time_label']} ({'bookable' if s['bookable'] else 'listed, not yet bookable'})"
         for s in sessions
     )
+
+
+def build_booking_url(*, movie_name: str, movie_code: str) -> str:
+    name_segment = urllib.parse.quote(movie_name)
+    code_segment = urllib.parse.quote(movie_code)
+    return f"https://carnivalcinemas.sg/#/{name_segment}/{code_segment}"
 
 
 # ── Main polling loop ────────────────────────────────────────────────────────
@@ -225,8 +247,22 @@ def run_watch_loop(
     start = time.monotonic()
     consecutive_failures = 0
     failure_alert_sent = False
+    stop_after = (
+        datetime.datetime.fromisoformat(target_date_value).replace(tzinfo=datetime.timezone.utc)
+        + _STOP_BUFFER
+    )
 
     while time.monotonic() - start < max_runtime_seconds:
+        if datetime.datetime.now(datetime.timezone.utc) >= stop_after:
+            logger.info("Target date has passed — stopping the watch for good.")
+            if github_token and repo and workflow_file:
+                disable_current_workflow(
+                    github_token=github_token,
+                    repo=repo,
+                    workflow_file=workflow_file,
+                )
+            return
+
         try:
             if state["stage"] == "movie":
                 movies = fetch_now_playing(location=location)
@@ -240,17 +276,19 @@ def run_watch_loop(
                 if movie is not None:
                     send_telegram_message(
                         f"🎬 {movie.get('name')} is now in the Now Showing list on "
-                        "carnivalcinemas.sg. Watching for a showtime between "
+                        "carnivalcinemas.sg. Watching for showtimes between "
                         f"{window_start.strftime('%I:%M %p')} and {window_end.strftime('%I:%M %p')} "
-                        "on the target date now.",
+                        "on the target date now — you'll get an alert for every "
+                        "matching showtime that appears, not just the first.",
                         bot_token=bot_token,
                         chat_id=chat_id,
                     )
-                    state["stage"] = "showtime"
+                    state["stage"] = "watching"
                     state["movie_code"] = movie.get("code")
+                    state["movie_name"] = movie.get("name")
                     save_state(state_path, state)
 
-            elif state["stage"] in ("showtime", "bookable"):
+            elif state["stage"] == "watching":
                 sessions = fetch_showtimes(
                     movie_code=state["movie_code"],
                     date_value=target_date_value,
@@ -258,46 +296,52 @@ def run_watch_loop(
                 )
                 matches = find_sessions_in_window(sessions, window_start=window_start, window_end=window_end)
                 logger.info(
-                    "Checked showtimes for target date (stage=%s) — %d session(s), %d in window %s-%s",
-                    state["stage"],
+                    "Checked showtimes for target date — %d session(s), %d in window %s-%s",
                     len(sessions),
                     len(matches),
                     window_start.strftime("%I:%M %p"),
                     window_end.strftime("%I:%M %p"),
                 )
 
-                if state["stage"] == "showtime" and matches:
-                    any_bookable = any(s["bookable"] for s in matches)
+                alerted_ids = set(state.get("alerted_session_ids", []))
+                bookable_ids = set(state.get("bookable_session_ids", []))
+                booking_url = build_booking_url(
+                    movie_name=state.get("movie_name") or state["movie_code"],
+                    movie_code=state["movie_code"],
+                )
+
+                new_sessions = [m for m in matches if m["session_id"] not in alerted_ids]
+                if new_sessions:
+                    any_new_bookable = any(s["bookable"] for s in new_sessions)
                     send_telegram_message(
-                        f"🕖 A showtime between {window_start.strftime('%I:%M %p')} and "
-                        f"{window_end.strftime('%I:%M %p')} on the target date has "
-                        f"appeared: {_format_sessions(matches)}."
-                        + (" Go book now!" if any_bookable else " Not bookable yet — still watching."),
+                        f"🕖 New showtime(s) between {window_start.strftime('%I:%M %p')} and "
+                        f"{window_end.strftime('%I:%M %p')} on the target date: "
+                        f"{_format_sessions(new_sessions)}."
+                        + (f" Go book now! {booking_url}" if any_new_bookable else " Not bookable yet — still watching."),
                         bot_token=bot_token,
                         chat_id=chat_id,
                     )
-                    state["stage"] = "done" if any_bookable else "bookable"
-                    save_state(state_path, state)
+                    for session in new_sessions:
+                        alerted_ids.add(session["session_id"])
+                        if session["bookable"]:
+                            bookable_ids.add(session["session_id"])
 
-                elif state["stage"] == "bookable":
-                    newly_bookable = [s for s in matches if s["bookable"]]
-                    if newly_bookable:
-                        send_telegram_message(
-                            f"✅ Now bookable: {_format_sessions(newly_bookable)}. Go book now!",
-                            bot_token=bot_token,
-                            chat_id=chat_id,
-                        )
-                        state["stage"] = "done"
-                        save_state(state_path, state)
-
-            if state["stage"] == "done":
-                if github_token and repo and workflow_file:
-                    disable_current_workflow(
-                        github_token=github_token,
-                        repo=repo,
-                        workflow_file=workflow_file,
+                newly_bookable = [
+                    m for m in matches if m["session_id"] in alerted_ids and m["session_id"] not in bookable_ids
+                ]
+                if newly_bookable:
+                    send_telegram_message(
+                        f"✅ Now bookable: {_format_sessions(newly_bookable)}. Go book now! {booking_url}",
+                        bot_token=bot_token,
+                        chat_id=chat_id,
                     )
-                return
+                    for session in newly_bookable:
+                        bookable_ids.add(session["session_id"])
+
+                if new_sessions or newly_bookable:
+                    state["alerted_session_ids"] = sorted(alerted_ids)
+                    state["bookable_session_ids"] = sorted(bookable_ids)
+                    save_state(state_path, state)
 
             consecutive_failures = 0
 
