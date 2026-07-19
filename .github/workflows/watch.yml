@@ -30,7 +30,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           WORKFLOW_FILE: watch.yml
-          TARGET_MOVIE: "Jananayagan"
+          TARGET_MOVIE: "GattaKusthi"
           TARGET_DATE_VALUE: "2026-07-23T00:00:00"
           CUTOFF_HOUR: "19"
           LOCATION: "Singapore"
