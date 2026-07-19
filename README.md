@@ -1,15 +1,18 @@
 # Carnival Cinemas Now-Showing Watcher
 
 Watches [carnivalcinemas.sg](https://carnivalcinemas.sg/#/) for a specific movie
-to appear in the Now Showing list, then watches for a showtime in a specific
-time window on a specific date, and sends a Telegram alert at each milestone —
-so you find out the moment tickets for the show you actually want can be
-booked, instead of refreshing the site by hand.
+to appear in the Now Showing list, then watches for showtimes in a specific
+time window on a specific date, and sends a Telegram alert — with a direct
+booking link — every time a new matching showtime shows up. So you find out
+the moment tickets for a show you'd actually attend can be booked, instead of
+refreshing the site by hand.
 
 Built for a real case: Tamil movie releases on this site tend to sell out
 within minutes of going live, and showtimes for a given date are sometimes
 posted in batches (e.g. a 1:30 PM show appears before the 7:00 PM one you
-actually want).
+actually want, and a better slot — say 7:45 PM — can show up even later).
+The watch doesn't stop at the first match; it keeps alerting for every
+distinct new showtime in the window until the target date itself has passed.
 
 ## Why this works without a browser
 
@@ -42,53 +45,61 @@ either way.
 
 ```mermaid
 flowchart TD
-    A[Load state.json] --> B{stage?}
+    A[Load state.json] --> S{Target date + 2-day<br/>buffer already passed?}
+    S -- yes --> T[Disable the GitHub Actions schedule, stop]
+    S -- no --> B{stage?}
+
     B -- movie --> C[Fetch GetNowPlayingMovies]
     C --> D{Target movie found?<br/>normalized substring match}
     D -- no --> Z[Sleep, loop]
     D -- yes --> E[Telegram: movie is showing]
-    E --> F[Save stage=showtime + movie_code]
+    E --> F[Save stage=watching + movie_code/name]
     F --> Z
 
-    B -- showtime --> G[Fetch GetCinemaAndShowTimeByMovie<br/>for target date]
-    G --> H{Any session in<br/>window_start-window_end?}
-    H -- no --> Z
-    H -- yes --> I{Any of those bookable?}
-    I -- yes --> J[Telegram: go book now]
-    I -- no --> K[Telegram: showtime listed,<br/>not bookable yet]
-    J --> L[Save stage=done]
-    K --> M[Save stage=bookable]
-    L --> N[Disable the GitHub Actions schedule]
-    M --> Z
-
-    B -- bookable --> G2[Fetch showtimes again]
-    G2 --> O{Now bookable?}
-    O -- no --> Z
-    O -- yes --> J
+    B -- watching --> G[Fetch GetCinemaAndShowTimeByMovie<br/>for target date]
+    G --> H[Filter sessions to window_start-window_end]
+    H --> I{Any session_id not in<br/>alerted_session_ids?}
+    I -- yes --> J[Telegram: new showtime found<br/>+ booking link if bookable]
+    J --> K[Add to alerted_session_ids<br/>+ bookable_session_ids if bookable]
+    I -- no --> L
+    K --> L{Any alerted session now<br/>bookable but not yet flagged so?}
+    L -- yes --> M[Telegram: now bookable<br/>+ booking link]
+    M --> N[Add to bookable_session_ids]
+    L -- no --> Z
+    N --> Z
 ```
 
 Each poll cycle is one pass through this diagram, then a
 `POLL_INTERVAL_SECONDS` sleep before the next pass, for up to
-`MAX_RUNTIME_SECONDS` per run.
+`MAX_RUNTIME_SECONDS` per run. Every distinct showtime is tracked by the
+site's own session ID (`longSessionID`), so a showtime that was already
+alerted never triggers a duplicate "new showtime" message — but it can still
+later trigger a one-time "now bookable" message if it started out listed but
+not yet bookable.
 
-## The four stages, persisted in `state.json`
+## The two stages, persisted in `state.json`
 
-1. **`movie`** — waiting for the target movie to show up in Now Showing at all.
-2. **`showtime`** — movie is showing; waiting for any showtime inside the
-   target time window to appear on the target date, in any state (listed or
-   bookable). Alerts once either way, so you're not blindsided if a listed
-   showtime turns out to be a non-target time.
-3. **`bookable`** — a matching showtime is listed but flagged not-bookable
-   yet (the site marks each session bookable/not with a trailing flag on the
-   showtime string); waiting for it to flip.
-4. **`done`** — a matching, bookable showtime was found and alerted. The
-   script calls the GitHub API to disable its own workflow schedule here, so
-   it stops running instead of alerting repeatedly.
+1. **`movie`** — waiting for the target movie to show up in Now Showing at
+   all.
+2. **`watching`** — movie is showing; every poll re-fetches showtimes for the
+   target date, filters to the target time window, and:
+   - alerts once for each showtime whose session ID hasn't been alerted
+     before (whatever its bookable state), including a direct booking link
+     if it's already bookable;
+   - separately alerts once more for any of those that later flip from
+     listed-not-bookable to bookable, again with the booking link.
 
-State is written to `state.json` and committed back to the repo after every
-run (see the "Persist state" step in the workflow) — that's what lets a
-5-hour-later restart resume from where it left off instead of re-alerting
-from scratch.
+There's no "done" stage anymore — finding a match doesn't stop the watch,
+since the site can release a better-fitting showtime after an earlier one.
+The watch only stops once the target date plus a 2-day safety buffer has
+fully passed, at which point the script calls the GitHub API to disable its
+own workflow schedule.
+
+State (`stage`, `movie_code`, `movie_name`, `alerted_session_ids`,
+`bookable_session_ids`) is written to `state.json` and committed back to the
+repo after every run (see the "Persist state" step in the workflow) — that's
+what lets a 5-hour-later restart resume from where it left off instead of
+re-alerting from scratch.
 
 ## Why polling restarts every 5 hours instead of running continuously
 
@@ -107,7 +118,7 @@ kills it. So instead of one long-lived process, the workflow:
 
 | File | Purpose |
 |---|---|
-| `watch_now_showing.py` | Everything: token auth, API calls, matching logic, Telegram alerts, state machine, self-disable. Stdlib only, no dependencies. |
+| `watch_now_showing.py` | Everything: token auth, API calls, matching logic, deep-link booking URL builder, Telegram alerts, state machine, self-disable. Stdlib only, no dependencies. |
 | `.github/workflows/watch.yml` | Schedules the script every 5 hours, wires up secrets/config as env vars, commits `state.json` back after each run. |
 | `state.json` | Current progress (created automatically on first run). Delete it to reset back to stage `movie`. |
 | `SETUP.md` | One-time setup: Telegram bot, GitHub secrets, permissions, test run. |
@@ -119,7 +130,7 @@ All set via env vars in `.github/workflows/watch.yml`:
 | Variable | Meaning | Default |
 |---|---|---|
 | `TARGET_MOVIE` | Movie name to watch for. Matching is case/space-insensitive substring, so `"Jana Nayagan"` matches `"JANANAYAGAN (TAMIL)"`. | `Jananayagan` |
-| `TARGET_DATE_VALUE` | The show date to watch, in the API's own format (`YYYY-MM-DDT00:00:00`). | `2026-07-23T00:00:00` |
+| `TARGET_DATE_VALUE` | The show date to watch, in the API's own format (`YYYY-MM-DDT00:00:00`). Also anchors the stop condition: the watch shuts itself off 2 days after this date. | `2026-07-23T00:00:00` |
 | `WINDOW_START` / `WINDOW_END` | Time-of-day range (24h `HH:MM`) a showtime must fall in to trigger an alert. | `18:30` / `20:00` |
 | `LOCATION` | City name as the API expects it. | `Singapore` |
 | `POLL_INTERVAL_SECONDS` | Seconds between polls within a run. | `90` |
