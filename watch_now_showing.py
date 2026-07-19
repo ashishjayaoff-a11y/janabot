@@ -135,13 +135,13 @@ def find_target_movie(
     return None
 
 
-def find_sessions_after_hour(
+def find_sessions_in_window(
     sessions: list[dict[str, Any]],
     *,
-    cutoff_hour: int,
+    window_start: datetime.time,
+    window_end: datetime.time,
 ) -> list[dict[str, Any]]:
-    cutoff = datetime.time(cutoff_hour, 0)
-    return [s for s in sessions if s["time_obj"] >= cutoff]
+    return [s for s in sessions if window_start <= s["time_obj"] <= window_end]
 
 
 # ── Telegram alerting ────────────────────────────────────────────────────────
@@ -209,7 +209,8 @@ def run_watch_loop(
     *,
     target_movie: str,
     target_date_value: str,
-    cutoff_hour: int,
+    window_start: datetime.time,
+    window_end: datetime.time,
     location: str,
     poll_interval_seconds: int,
     max_runtime_seconds: int,
@@ -239,8 +240,9 @@ def run_watch_loop(
                 if movie is not None:
                     send_telegram_message(
                         f"🎬 {movie.get('name')} is now in the Now Showing list on "
-                        "carnivalcinemas.sg. Watching for a showtime after "
-                        f"{cutoff_hour}:00 on the target date now.",
+                        "carnivalcinemas.sg. Watching for a showtime between "
+                        f"{window_start.strftime('%I:%M %p')} and {window_end.strftime('%I:%M %p')} "
+                        "on the target date now.",
                         bot_token=bot_token,
                         chat_id=chat_id,
                     )
@@ -254,19 +256,21 @@ def run_watch_loop(
                     date_value=target_date_value,
                     location=location,
                 )
-                matches = find_sessions_after_hour(sessions, cutoff_hour=cutoff_hour)
+                matches = find_sessions_in_window(sessions, window_start=window_start, window_end=window_end)
                 logger.info(
-                    "Checked showtimes for target date (stage=%s) — %d session(s), %d after %d:00",
+                    "Checked showtimes for target date (stage=%s) — %d session(s), %d in window %s-%s",
                     state["stage"],
                     len(sessions),
                     len(matches),
-                    cutoff_hour,
+                    window_start.strftime("%I:%M %p"),
+                    window_end.strftime("%I:%M %p"),
                 )
 
                 if state["stage"] == "showtime" and matches:
                     any_bookable = any(s["bookable"] for s in matches)
                     send_telegram_message(
-                        f"🕖 A showtime after {cutoff_hour}:00 on the target date has "
+                        f"🕖 A showtime between {window_start.strftime('%I:%M %p')} and "
+                        f"{window_end.strftime('%I:%M %p')} on the target date has "
                         f"appeared: {_format_sessions(matches)}."
                         + (" Go book now!" if any_bookable else " Not bookable yet — still watching."),
                         bot_token=bot_token,
@@ -321,7 +325,12 @@ def _main() -> None:
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
     target_movie = os.environ.get("TARGET_MOVIE", "Jananayagan")
     target_date_value = os.environ.get("TARGET_DATE_VALUE", "2026-07-23T00:00:00")
-    cutoff_hour = int(os.environ.get("CUTOFF_HOUR", "19"))
+    window_start = datetime.datetime.strptime(
+        os.environ.get("WINDOW_START", "18:30"), "%H:%M"
+    ).time()
+    window_end = datetime.datetime.strptime(
+        os.environ.get("WINDOW_END", "20:00"), "%H:%M"
+    ).time()
     location = os.environ.get("LOCATION", "Singapore")
     poll_interval_seconds = int(os.environ.get("POLL_INTERVAL_SECONDS", "90"))
     max_runtime_seconds = int(os.environ.get("MAX_RUNTIME_SECONDS", "17400"))
@@ -330,7 +339,8 @@ def _main() -> None:
     run_watch_loop(
         target_movie=target_movie,
         target_date_value=target_date_value,
-        cutoff_hour=cutoff_hour,
+        window_start=window_start,
+        window_end=window_end,
         location=location,
         poll_interval_seconds=poll_interval_seconds,
         max_runtime_seconds=max_runtime_seconds,
