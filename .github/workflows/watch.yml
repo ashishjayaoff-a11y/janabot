@@ -31,7 +31,7 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           WORKFLOW_FILE: watch.yml
           TARGET_MOVIE: "GattaKusthi"
-          TARGET_DATE_VALUE: "2026-07-23T00:00:00"
+          TARGET_DATE_VALUE: "2026-07-20T00:00:00"
           WINDOW_START: "11:30"
           WINDOW_END: "20:00"
           LOCATION: "Singapore"
