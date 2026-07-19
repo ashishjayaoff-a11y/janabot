@@ -32,7 +32,8 @@ jobs:
           WORKFLOW_FILE: watch.yml
           TARGET_MOVIE: "Jananayagan"
           TARGET_DATE_VALUE: "2026-07-23T00:00:00"
-          CUTOFF_HOUR: "19"
+          WINDOW_START: "18:30"
+          WINDOW_END: "20:00"
           LOCATION: "Singapore"
           POLL_INTERVAL_SECONDS: "90"
           MAX_RUNTIME_SECONDS: "17400"
