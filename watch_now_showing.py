@@ -226,6 +226,12 @@ def run_watch_loop(
             if state["stage"] == "movie":
                 movies = fetch_now_playing(location=location)
                 movie = find_target_movie(movies, target_name=target_movie)
+                logger.info(
+                    "Checked Now Showing (%d titles) — %s: %s",
+                    len(movies),
+                    target_movie,
+                    "found!" if movie else "not listed yet",
+                )
                 if movie is not None:
                     send_telegram_message(
                         f"🎬 {movie.get('name')} is now in the Now Showing list on "
@@ -245,6 +251,13 @@ def run_watch_loop(
                     location=location,
                 )
                 matches = find_sessions_after_hour(sessions, cutoff_hour=cutoff_hour)
+                logger.info(
+                    "Checked showtimes for target date (stage=%s) — %d session(s), %d after %d:00",
+                    state["stage"],
+                    len(sessions),
+                    len(matches),
+                    cutoff_hour,
+                )
 
                 if state["stage"] == "showtime" and matches:
                     any_bookable = any(s["bookable"] for s in matches)
