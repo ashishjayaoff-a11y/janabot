@@ -119,14 +119,18 @@ def fetch_showtimes(
     return sessions
 
 
+def _normalize_title(text: str) -> str:
+    return "".join(text.lower().split())
+
+
 def find_target_movie(
     movies: list[dict[str, Any]],
     *,
     target_name: str,
 ) -> dict[str, Any] | None:
-    needle = target_name.strip().lower()
+    needle = _normalize_title(target_name)
     for movie in movies:
-        if needle in movie.get("name", "").lower():
+        if needle in _normalize_title(movie.get("name", "")):
             return movie
     return None
 
